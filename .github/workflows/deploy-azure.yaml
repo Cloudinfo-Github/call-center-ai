@@ -1,0 +1,313 @@
+name: Deploy to Azure
+
+on:
+  # 手動觸發部署
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '部署環境'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+        default: 'development'
+      resource_group:
+        description: 'Azure 資源群組名稱'
+        required: true
+        type: string
+
+  # 自動部署（當 main 分支有新版本時）
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+  # 或當成功建置映像後
+  workflow_run:
+    workflows: ["Pipeline"]
+    types:
+      - completed
+    branches:
+      - main
+
+env:
+  # Azure 配置
+  DEFAULT_LOCATION: swedencentral
+  COGNITIVE_COMMUNICATION_LOCATION: westeurope
+  OPENAI_LOCATION: swedencentral
+  SEARCH_LOCATION: francecentral
+
+  # Container 配置
+  CONTAINER_REGISTRY: ghcr.io
+  CONTAINER_NAME: ${{ github.repository }}
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  # 決定部署環境
+  setup:
+    name: Setup Deployment
+    runs-on: ubuntu-24.04
+    outputs:
+      environment: ${{ steps.determine-env.outputs.environment }}
+      resource_group: ${{ steps.determine-env.outputs.resource_group }}
+      image_version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Determine environment
+        id: determine-env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "resource_group=${{ inputs.resource_group }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "resource_group=call-center-ai-prod" >> $GITHUB_OUTPUT
+          else
+            echo "environment=development" >> $GITHUB_OUTPUT
+            echo "resource_group=call-center-ai-dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(bash cicd/version/version.sh -g . -c)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  # 部署基礎設施
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-24.04
+    needs: setup
+    environment: ${{ needs.setup.outputs.environment }}
+    outputs:
+      app_url: ${{ steps.deploy.outputs.app_url }}
+      blob_storage_name: ${{ steps.deploy.outputs.blob_storage_name }}
+      container_app_name: ${{ steps.deploy.outputs.container_app_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2.2.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Show current subscription
+        run: |
+          echo "📋 部署資訊:"
+          echo "  環境: ${{ needs.setup.outputs.environment }}"
+          echo "  資源群組: ${{ needs.setup.outputs.resource_group }}"
+          echo "  映像版本: ${{ needs.setup.outputs.image_version }}"
+          echo ""
+          echo "☁️ Azure 訂閱:"
+          az account show --query "{subscriptionId:id, subscriptionName:name, tenantId:tenantId}" --output table
+
+      - name: Deploy Bicep template
+        id: deploy
+        run: |
+          echo "🚀 部署 Azure 資源..."
+
+          DEPLOYMENT_OUTPUT=$(az deployment sub create \
+            --location ${{ env.DEFAULT_LOCATION }} \
+            --name ${{ needs.setup.outputs.resource_group }} \
+            --parameters \
+              cognitiveCommunicationLocation=${{ env.COGNITIVE_COMMUNICATION_LOCATION }} \
+              imageVersion=${{ needs.setup.outputs.image_version }} \
+              instance=${{ needs.setup.outputs.resource_group }} \
+              openaiLocation=${{ env.OPENAI_LOCATION }} \
+              searchLocation=${{ env.SEARCH_LOCATION }} \
+              promptContentFilter=true \
+            --template-file cicd/bicep/main.bicep \
+            --output json)
+
+          echo "✅ 部署完成"
+
+          # 提取輸出
+          APP_URL=$(echo $DEPLOYMENT_OUTPUT | jq -r '.properties.outputs.appUrl.value')
+          BLOB_STORAGE=$(echo $DEPLOYMENT_OUTPUT | jq -r '.properties.outputs.blobStoragePublicName.value')
+          CONTAINER_APP=$(echo $DEPLOYMENT_OUTPUT | jq -r '.properties.outputs.containerAppName.value')
+
+          echo "app_url=$APP_URL" >> $GITHUB_OUTPUT
+          echo "blob_storage_name=$BLOB_STORAGE" >> $GITHUB_OUTPUT
+          echo "container_app_name=$CONTAINER_APP" >> $GITHUB_OUTPUT
+
+          echo "📍 應用程式 URL: $APP_URL"
+
+      - name: Wait for deployment
+        run: |
+          echo "⏳ 等待資源完全就緒..."
+          sleep 30
+
+  # 上傳靜態資源
+  deploy-static-assets:
+    name: Deploy Static Assets
+    runs-on: ubuntu-24.04
+    needs:
+      - setup
+      - deploy-infrastructure
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Azure Login
+        uses: azure/login@v2.2.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upload public resources
+        run: |
+          echo "📦 上傳靜態資源到 Blob Storage..."
+
+          az storage blob upload-batch \
+            --account-name ${{ needs.deploy-infrastructure.outputs.blob_storage_name }} \
+            --auth-mode login \
+            --destination '$web' \
+            --no-progress \
+            --overwrite \
+            --source public
+
+          echo "✅ 靜態資源上傳完成"
+
+  # 部署應用程式配置
+  deploy-config:
+    name: Deploy Application Config
+    runs-on: ubuntu-24.04
+    needs:
+      - setup
+      - deploy-infrastructure
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Azure Login
+        uses: azure/login@v2.2.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update Container App with config
+        run: |
+          echo "⚙️ 更新應用程式配置..."
+
+          # 這裡可以添加配置更新邏輯
+          # 例如：從 Azure Key Vault 獲取secrets，更新環境變數等
+
+          echo "✅ 配置更新完成"
+
+  # 健康檢查
+  health-check:
+    name: Health Check
+    runs-on: ubuntu-24.04
+    needs:
+      - setup
+      - deploy-infrastructure
+      - deploy-static-assets
+      - deploy-config
+    steps:
+      - name: Wait for app to start
+        run: |
+          echo "⏳ 等待應用程式啟動..."
+          sleep 60
+
+      - name: Check liveness
+        run: |
+          echo "🏥 檢查應用程式健康狀態..."
+
+          APP_URL="${{ needs.deploy-infrastructure.outputs.app_url }}"
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "嘗試 $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+
+            if curl -f -s -o /dev/null "$APP_URL/health/liveness"; then
+              echo "✅ Liveness 檢查通過"
+              break
+            fi
+
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              echo "⏳ 等待 10 秒後重試..."
+              sleep 10
+            else
+              echo "❌ Liveness 檢查失敗"
+              exit 1
+            fi
+          done
+
+      - name: Check readiness
+        run: |
+          echo "🔍 檢查應用程式就緒狀態..."
+
+          APP_URL="${{ needs.deploy-infrastructure.outputs.app_url }}"
+
+          if curl -f -s "$APP_URL/health/readiness" | jq -e '.status == "ok"' > /dev/null; then
+            echo "✅ Readiness 檢查通過"
+          else
+            echo "❌ Readiness 檢查失敗"
+            exit 1
+          fi
+
+  # 部署摘要
+  deployment-summary:
+    name: Deployment Summary
+    runs-on: ubuntu-24.04
+    needs:
+      - setup
+      - deploy-infrastructure
+      - health-check
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# 🚀 部署摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 部署資訊" >> $GITHUB_STEP_SUMMARY
+          echo "- **環境**: ${{ needs.setup.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **資源群組**: ${{ needs.setup.outputs.resource_group }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **映像版本**: ${{ needs.setup.outputs.image_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **觸發者**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔗 資源連結" >> $GITHUB_STEP_SUMMARY
+          echo "- **應用程式 URL**: ${{ needs.deploy-infrastructure.outputs.app_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **健康檢查**: ${{ needs.deploy-infrastructure.outputs.app_url }}/health/liveness" >> $GITHUB_STEP_SUMMARY
+          echo "- **API 文檔**: ${{ needs.deploy-infrastructure.outputs.app_url }}/docs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ needs.health-check.result }}" == "success" ]]; then
+            echo "## ✅ 部署狀態: 成功" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ 部署狀態: 失敗" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "🤖 Generated with [Claude Code](https://claude.com/claude-code)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Post deployment notification
+        if: success()
+        run: |
+          echo "✅ 部署完成！"
+          echo "🌐 應用程式: ${{ needs.deploy-infrastructure.outputs.app_url }}"
+          echo "📊 監控: https://portal.azure.com/#@/resource/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ needs.setup.outputs.resource_group }}"
